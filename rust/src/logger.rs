@@ -1,9 +1,10 @@
 //! Simple log file writer.
 //!
-//! Appends timestamped lines to `zDirComp.log` next to the executable.
+//! Prepends timestamped lines to `zDirComp.log` next to the executable.
+//! Newest entries are always at the top of the file.
 //! All errors are silently ignored (best-effort logging).
 
-use std::fs::OpenOptions;
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -81,11 +82,18 @@ fn local_utc_offset_secs() -> i64 {
     }
 }
 
-/// Append a log line to the log file.
+/// Prepend a log line to the top of the log file (newest first).
 pub fn log(message: &str) {
     if let Some(path) = log_path() {
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(file, "{} {}", timestamp(), message);
+        let new_line = format!("{} {}\n", timestamp(), message);
+
+        // Read existing content (empty if file doesn't exist yet)
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+
+        // Write new line + existing content
+        if let Ok(mut file) = fs::File::create(&path) {
+            let _ = file.write_all(new_line.as_bytes());
+            let _ = file.write_all(existing.as_bytes());
         }
     }
 }
