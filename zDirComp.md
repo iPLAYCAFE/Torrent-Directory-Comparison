@@ -181,19 +181,6 @@ cmd /c start /b "" "%localappdata%\AutoSync\BitTorrent\zDirComp.exe" sync "%loca
 | `%N.torrent` | ชื่อ torrent file (uTorrent variable) |
 | `"%D"` | โฟลเดอร์ที่ดาวน์โหลดไว้ (uTorrent variable) |
 
-#### ช่อง 2: "Run this program when a torrent changes state:"
-
-```bat
-cmd /c if "%S"=="23" start /b "" "%localappdata%\AutoSync\BitTorrent\zDirComp.exe" unlock "%D"
-```
-
-| ส่วน | หน้าที่ |
-|---|---|
-| `if "%S"=="23"` | กรองเฉพาะ state 23 (Finding Peers) — ก่อนจะเริ่มโหลด |
-| `start /b ""` | รันแบบ background |
-| `zDirComp.exe unlock` | เรียกโหมด Unlock |
-| `"%D"` | โฟลเดอร์ดาวน์โหลด |
-
 ---
 
 ## Logging
