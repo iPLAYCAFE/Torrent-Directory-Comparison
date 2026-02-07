@@ -1,7 +1,8 @@
-//! Mode 2: Unlock — kill processes locking files in the torrent directory.
+//! Mode 2: Unlock — kill processes locking files in a directory.
 //!
 //! Uses Win32 Restart Manager API via raw FFI (no external crates).
-//! Excludes uTorrent.exe and BitTorrent.exe from termination.
+//! Uses RmShutdown(RmForceShutdown) — same approach as rqbit.
+//! Terminates ALL locking processes (no exclusions).
 
 use crate::logger;
 use crate::safety;
@@ -18,47 +19,13 @@ type DWORD = u32;
 #[allow(non_camel_case_types)]
 type WCHAR = u16;
 #[allow(non_camel_case_types)]
-type BOOL = i32;
-#[allow(non_camel_case_types)]
-type HANDLE = *mut std::ffi::c_void;
-#[allow(non_camel_case_types)]
 type LPCWSTR = *const u16;
 #[allow(non_camel_case_types)]
 type UINT = u32;
 
 const ERROR_MORE_DATA: DWORD = 234;
-const PROCESS_TERMINATE: DWORD = 0x0001;
-const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
-const CCH_RM_SESSION_KEY: usize = 32; // Character count, +1 for null
-const CCH_RM_MAX_APP_NAME: usize = 255;
-const CCH_RM_MAX_SVC_NAME: usize = 63;
-
-#[repr(C)]
-#[derive(Clone)]
-#[allow(non_snake_case)]
-struct RM_UNIQUE_PROCESS {
-    dwProcessId: DWORD,
-    ProcessStartTime: u64, // FILETIME as u64
-}
-
-#[repr(C)]
-#[derive(Clone)]
-#[allow(non_snake_case)]
-struct RM_PROCESS_INFO {
-    Process: RM_UNIQUE_PROCESS,
-    strAppName: [WCHAR; CCH_RM_MAX_APP_NAME + 1],
-    strServiceShortName: [WCHAR; CCH_RM_MAX_SVC_NAME + 1],
-    ApplicationType: DWORD,
-    AppStatus: DWORD,
-    TSSessionId: DWORD,
-    bRestartable: BOOL,
-}
-
-impl Default for RM_PROCESS_INFO {
-    fn default() -> Self {
-        unsafe { std::mem::zeroed() }
-    }
-}
+const RM_FORCE_SHUTDOWN: DWORD = 1;
+const CCH_RM_SESSION_KEY: usize = 32;
 
 #[link(name = "rstrtmgr")]
 extern "system" {
@@ -75,7 +42,7 @@ extern "system" {
         nFiles: UINT,
         rgsFileNames: *const LPCWSTR,
         nApplications: UINT,
-        rgApplications: *const RM_UNIQUE_PROCESS,
+        rgApplications: *const std::ffi::c_void,
         nServices: UINT,
         rgsServiceNames: *const LPCWSTR,
     ) -> DWORD;
@@ -84,22 +51,15 @@ extern "system" {
         dwSessionHandle: DWORD,
         pnProcInfoNeeded: *mut UINT,
         pnProcInfo: *mut UINT,
-        rgAffectedApps: *mut RM_PROCESS_INFO,
+        rgAffectedApps: *mut std::ffi::c_void,
         lpdwRebootReasons: *mut DWORD,
     ) -> DWORD;
-}
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
-    fn TerminateProcess(hProcess: HANDLE, uExitCode: UINT) -> BOOL;
-    fn CloseHandle(hObject: HANDLE) -> BOOL;
-    fn QueryFullProcessImageNameW(
-        hProcess: HANDLE,
-        dwFlags: DWORD,
-        lpExeName: *mut WCHAR,
-        lpdwSize: *mut DWORD,
-    ) -> BOOL;
+    fn RmShutdown(
+        dwSessionHandle: DWORD,
+        lActionFlags: DWORD,
+        fnStatus: *const std::ffi::c_void,
+    ) -> DWORD;
 }
 
 // ============================================================
@@ -123,44 +83,6 @@ impl Drop for RmSessionGuard {
 /// Convert a Rust string to a null-terminated UTF-16 wide string.
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Convert a null-terminated UTF-16 slice to a Rust String.
-fn from_wide(s: &[u16]) -> String {
-    let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
-    String::from_utf16_lossy(&s[..end])
-}
-
-/// Get the executable name of a process by PID.
-fn get_process_exe_name(pid: DWORD) -> Option<String> {
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return None;
-        }
-
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as DWORD;
-        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
-        CloseHandle(handle);
-
-        if ok != 0 {
-            let full_path = from_wide(&buf[..size as usize]);
-            // Extract just the filename
-            full_path
-                .rsplit('\\')
-                .next()
-                .map(|s| s.to_string())
-        } else {
-            None
-        }
-    }
-}
-
-/// Check if a process name is in the exclusion list (case-insensitive).
-fn is_excluded(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == "utorrent.exe" || lower == "bittorrent.exe"
 }
 
 /// Collect all file paths recursively from a directory.
@@ -226,7 +148,7 @@ pub fn run(dir_path: &str) {
     let wide_ptrs: Vec<LPCWSTR> = wide_paths.iter().map(|w| w.as_ptr()).collect();
 
     unsafe {
-        // Start Restart Manager session
+        // Step 1: Start Restart Manager session
         let mut session_handle: DWORD = 0;
         let mut session_key = [0u16; CCH_RM_SESSION_KEY + 1];
 
@@ -243,10 +165,10 @@ pub fn run(dir_path: &str) {
             return;
         }
 
-        // RAII guard ensures RmEndSession is called
+        // RAII guard ensures RmEndSession is called even on error/panic
         let _guard = RmSessionGuard(session_handle);
 
-        // Register files
+        // Step 2: Register all files with Restart Manager
         let result = RmRegisterResources(
             session_handle,
             wide_ptrs.len() as UINT,
@@ -264,7 +186,7 @@ pub fn run(dir_path: &str) {
             return;
         }
 
-        // Query for locking processes (first call to get count)
+        // Step 3: Query for locking processes (just to get count for logging)
         let mut reason: DWORD = 0;
         let mut n_proc_info_needed: UINT = 0;
         let mut n_proc_info: UINT = 0;
@@ -293,71 +215,28 @@ pub fn run(dir_path: &str) {
             return;
         }
 
-        // Second call to get actual process info
-        n_proc_info = n_proc_info_needed;
-        let mut proc_infos = vec![RM_PROCESS_INFO::default(); n_proc_info as usize];
+        let count = n_proc_info_needed;
 
-        let result = RmGetList(
+        // Step 4: RmShutdown — let Restart Manager terminate all locking processes
+        // Flag 1 = RmForceShutdown: graceful first, then force if needed
+        let result = RmShutdown(
             session_handle,
-            &mut n_proc_info_needed,
-            &mut n_proc_info,
-            proc_infos.as_mut_ptr(),
-            &mut reason,
+            RM_FORCE_SHUTDOWN,
+            std::ptr::null(),
         );
-        if result != 0 {
+
+        if result == 0 {
             logger::log(&format!(
-                "UNLOCK {:?} — RmGetList (second call) failed (error {})",
-                dir_path, result
-            ));
-            return;
-        }
-
-        // Process each locking process
-        let mut killed = 0u32;
-        let mut skipped_names = Vec::new();
-        let mut killed_names = Vec::new();
-
-        for i in 0..n_proc_info as usize {
-            let pid = proc_infos[i].Process.dwProcessId;
-            let app_name = from_wide(&proc_infos[i].strAppName);
-
-            // Get the actual exe name for exclusion check
-            let exe_name = get_process_exe_name(pid).unwrap_or_default();
-
-            if is_excluded(&exe_name) {
-                skipped_names.push(exe_name);
-                continue;
-            }
-
-            // Terminate the process
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !handle.is_null() {
-                if TerminateProcess(handle, 1) != 0 {
-                    killed += 1;
-                    killed_names.push(if exe_name.is_empty() {
-                        app_name.clone()
-                    } else {
-                        exe_name
-                    });
-                }
-                CloseHandle(handle);
-            }
-        }
-
-        // Log summary
-        let mut msg = format!("UNLOCK {:?}", dir_path);
-        if killed > 0 {
-            msg.push_str(&format!(
-                " — killed {} process(es) ({})",
-                killed,
-                killed_names.join(", ")
+                "UNLOCK {:?} — terminated {} locking process(es)",
+                dir_path, count
             ));
         } else {
-            msg.push_str(" — no processes to terminate");
+            logger::log(&format!(
+                "UNLOCK {:?} — RmShutdown failed (error {}), {} process(es) may still be locking",
+                dir_path, result, count
+            ));
         }
-        if !skipped_names.is_empty() {
-            msg.push_str(&format!(", skipped {}", skipped_names.join(", ")));
-        }
-        logger::log(&msg);
+
+        // RmEndSession is called automatically by _guard Drop
     }
 }

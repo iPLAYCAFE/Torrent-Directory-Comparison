@@ -1,8 +1,8 @@
 # zDirComp.exe — Specification
 
-Pure Rust CLI สำหรับ Windows 10/11 ใช้ร่วมกับ uTorrent/BitTorrent เพื่อ:
-1. **ลบไฟล์เกิน** ที่ไม่อยู่ใน torrent ออกจากโฟลเดอร์ดาวน์โหลด
-2. **ปลดล็อกไฟล์** โดย terminate process ที่ล็อกไฟล์ (ยกเว้น uTorrent/BitTorrent)
+Pure Rust CLI สำหรับ Windows 10/11 เพื่อ:
+1. **ลบไฟล์เกิน** ที่ไม่อยู่ใน torrent ออกจากโฟลเดอร์ดาวน์โหลด (ใช้ร่วมกับ uTorrent/BitTorrent)
+2. **ปลดล็อกไฟล์** โดย terminate ทุก process ที่ล็อกไฟล์ ผ่าน `RmShutdown(RmForceShutdown)` (ใช้งานผ่าน cmd ได้โดยตรง)
 
 ทดแทน `zDirComp.jar` (Java) ได้ทันที — ไม่ต้องติดตั้ง JRE อีกต่อไป
 
@@ -87,56 +87,49 @@ zDirComp.exe unlock <directory>
 
 | Argument | Description | Example |
 |---|---|---|
-| `<directory>` | Path ถึงโฟลเดอร์ดาวน์โหลด | `E:\Online\MyFiles` |
+| `<directory>` | Path ถึงโฟลเดอร์ที่ต้องการปลดล็อก | `E:\Online\MyFiles` |
 
 ### ลำดับการทำงาน
 
 ```
-1. ซ่อนหน้าต่าง console
-2. ตรวจสอบ Safety Guard — path ต้องลึกอย่างน้อย 3 ระดับ
-3. Walk ทุกไฟล์ในโฟลเดอร์ (recursive)
-4. เรียก Win32 Restart Manager API:
+1. ตรวจสอบ Safety Guard — path ต้องลึกอย่างน้อย 3 ระดับ
+2. Walk ทุกไฟล์ในโฟลเดอร์ (recursive)
+3. เรียก Win32 Restart Manager API:
    a. RmStartSession()
    b. RmRegisterResources() — ลงทะเบียนไฟล์ทั้งหมด
-   c. RmGetList() — ดึงรายชื่อ process ที่ล็อกไฟล์
-   d. กรอง process — ข้าม uTorrent.exe และ BitTorrent.exe
-   e. terminate เฉพาะ process ที่ไม่ใช่ torrent client (ใช้ TerminateProcess)
-   f. RmEndSession()
-5. เขียน log สรุปผล
+   c. RmGetList() — ดึงจำนวน process ที่ล็อกไฟล์
+   d. RmShutdown(RmForceShutdown) — terminate ทุก process ที่ล็อก
+   e. RmEndSession() (เรียกอัตโนมัติผ่าน RAII Drop)
+4. เขียน log สรุปผล
 ```
 
-### Trigger
+### การใช้งาน
 
-ผ่าน uTorrent → **"Run this program when a torrent changes state:"**
+ใช้งานผ่าน **cmd/terminal ได้โดยตรง** — ไม่จำเป็นต้องผ่าน uTorrent
 
-เมื่อ torrent เข้าสถานะ **Finding Peers (23)** → แสดงว่ากำลังจะเริ่มดาวน์โหลด → ปลดล็อกไฟล์ก่อน
+```cmd
+zDirComp.exe unlock "E:\Online\MyFiles"
+```
 
-> **สำคัญ:** uTorrent เรียก command ทุกครั้งที่ state เปลี่ยน ไม่ว่า state จะเป็นอะไร ดังนั้นต้องกรอง `%S=="23"` ในตัว command เอง (ดูหัวข้อ [การตั้งค่า uTorrent](#การตั้งค่า-utorrent))
+> สามารถตั้งค่าผ่าน uTorrent ได้เช่นกัน (ดูหัวข้อ [การตั้งค่า uTorrent](#การตั้งค่า-utorrent))
 
-### Process Exclusion
+### วิธีทำงาน: RmShutdown(RmForceShutdown)
 
-เนื่องจากเราไม่สามารถใช้ `RmShutdown` ได้โดยตรง (จะ terminate uTorrent ด้วย) จึงต้อง:
-1. ใช้ `RmGetList` ดึงรายชื่อ process ที่ล็อกไฟล์
-2. วนลูปตรวจชื่อทีละ process
-3. ข้าม uTorrent.exe / BitTorrent.exe
-4. terminate ด้วย `TerminateProcess` เฉพาะ process ที่ไม่อยู่ใน exclusion list
+ใช้ **Restart Manager** ตัวเดียวกับที่ rqbit ใช้ — ให้ Windows จัดการ terminate เอง:
 
-| Process | จัดการ |
-|---|---|
-| `uTorrent.exe` | ❌ **ข้าม** — ห้าม terminate เด็ดขาด |
-| `BitTorrent.exe` | ❌ **ข้าม** — ห้าม terminate เด็ดขาด |
-| `explorer.exe` | ✅ terminate ได้ (Windows จะ restart ให้อัตโนมัติ) |
-| process อื่น ๆ | ✅ terminate ได้ |
+1. RM ส่ง `WM_CLOSE` ให้ app ปิดตัวอย่าง graceful ก่อน
+2. ถ้าไม่ตอบสนอง → force terminate
+3. RM มี authority สูงกว่า `TerminateProcess` → จัดการ elevated process ได้ดีกว่า
+4. **ไม่มี process exclusion** — terminate ทุก process ที่ล็อก (รวม torrent client ถ้ามี)
 
 ### ความปลอดภัย
 
 | Guard | รายละเอียด |
 |---|---|
-| **Process exclusion** | ไม่ kill torrent client |
 | **Depth check** | ป้องกัน path ตื้นเกินไป |
 | **RAII session guard** | `RmEndSession()` ถูกเรียกเสมอ แม้เกิด error |
-| **Error tolerance** | ถ้า terminate ไม่ได้ ก็ข้ามไป — ไม่ crash |
-| **Hidden window** | ไม่แสดง console popup |
+| **RmForceShutdown** | graceful ก่อน → force เฉพาะที่ไม่ตอบสนอง |
+| **Error tolerance** | ถ้า shutdown ไม่ได้ → เขียน log, ไม่ crash |
 
 ---
 
@@ -211,7 +204,7 @@ Log file อยู่ที่ `zDirComp.log` ข้าง ๆ `.exe` — append
 
 ```
 [2026-02-07 21:30:00] SYNC "E:\Online\MyTorrent" — deleted 3 files, 1 empty dir
-[2026-02-07 21:30:05] UNLOCK "E:\Online\MyTorrent" — killed 1 process (explorer.exe), skipped BitTorrent.exe
+[2026-02-07 21:30:05] UNLOCK "E:\Online\MyTorrent" — terminated 2 locking process(es)
 [2026-02-07 21:31:00] SYNC "E:\Mobile\B" — path too shallow, aborted
 [2026-02-07 21:32:00] SYNC "E:\Online\Stuff" — torrent file not found, aborted
 ```
@@ -222,7 +215,7 @@ Log file อยู่ที่ `zDirComp.log` ข้าง ๆ `.exe` — append
 |---|---|
 | Sync สำเร็จ | `SYNC "dir" — deleted N files, M empty dirs` |
 | Sync ไม่มีอะไรลบ | `SYNC "dir" — clean, nothing to remove` |
-| Unlock สำเร็จ | `UNLOCK "dir" — killed N processes (names), skipped M` |
+| Unlock สำเร็จ | `UNLOCK "dir" — terminated N locking process(es)` |
 | Unlock ไม่มี lock | `UNLOCK "dir" — no locking processes found` |
 | Path ตื้นเกินไป | `MODE "dir" — path too shallow, aborted` |
 | .torrent ไม่เจอ | `SYNC "file" — torrent file not found, aborted` |
@@ -239,7 +232,7 @@ Log file อยู่ที่ `zDirComp.log` ข้าง ๆ `.exe` — append
 | ภาษา | Pure Rust |
 | Target | `x86_64-pc-windows-msvc` |
 | Icon | ใช้ icon default ของ Windows (ไม่ embed icon) |
-| Window subsystem | `#![windows_subsystem = "windows"]` (ซ่อน console) |
+| Console | แสดง output ได้ปกติ — ใช้ `start /b` ใน uTorrent command เพื่อซ่อน |
 | Dependencies | **ไม่มี** external library — ใช้ `std` + Win32 FFI โดยตรง |
 | Output | `zDirComp.exe` (single static binary) |
 
@@ -268,12 +261,9 @@ Torrent-Directory-Comparison/
 |---|---|---|
 | `RmStartSession` | unlock | เริ่ม Restart Manager session |
 | `RmRegisterResources` | unlock | ลงทะเบียนไฟล์ที่ต้องการตรวจ |
-| `RmGetList` | unlock | ดึงรายชื่อ process ที่ล็อกไฟล์ |
+| `RmGetList` | unlock | ดึงจำนวน process ที่ล็อกไฟล์ |
+| `RmShutdown` | unlock | terminate ทุก process ที่ล็อก (RmForceShutdown) |
 | `RmEndSession` | unlock | จบ session |
-| `OpenProcess` | unlock | เปิด process handle |
-| `TerminateProcess` | unlock | terminate process ที่ล็อก (selective) |
-| `QueryFullProcessImageNameW` | unlock | อ่านชื่อ executable ของ process |
-| `CloseHandle` | unlock | ปิด handle |
 
 ### Bencode Parser
 
@@ -290,5 +280,5 @@ Port จาก `BencodeSerializer.java` → Rust:
 | Bencode format ผิด | เขียน log + exit code 1 |
 | Path ตื้นเกินไป | เขียน log + exit code 1 |
 | ลบไฟล์ไม่ได้ (permission) | เขียน log + ข้ามไป ทำต่อ |
-| Restart Manager error | เขียน log + ข้ามไป ทำต่อ |
+| RmShutdown ล้มเหลว | เขียน log + รายงาน error code |
 | process terminate ไม่ได้ | เขียน log + ข้ามไป ทำต่อ |
